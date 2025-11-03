@@ -1,6 +1,5 @@
 import os
 import logging
-import json
 import time
 from typing import Optional
 
@@ -9,53 +8,44 @@ from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ParseMode
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
-# ======================
-# ЛОГИ
-# ======================
+# -------------------- ЛОГИ --------------------
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger("AyaBot")
 
-# ======================
-# ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
-# ======================
+# ---------------- ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-MAKE_WEBHOOK_URL = os.getenv("MAKE_WEBHOOK_URL", "")  # опционально
+MAKE_WEBHOOK_URL = os.getenv("MAKE_WEBHOOK_URL", "")
 
-# ======================
-# OPENAI (через официальный клиент 1.x)
-# ======================
+GOOGLE_FORM_URL = os.getenv("GOOGLE_FORM_URL", "")
+GOOGLE_FORM_PREFILL_TEMPLATE = os.getenv("GOOGLE_FORM_PREFILL_TEMPLATE", "")
+
+# --------------- СИСТЕМНЫЙ ПРОМПТ ДЛЯ ОТВЕТОВ ---------------
 def ask_aya_system_prompt() -> str:
     return (
         "Ты — Ая, тёплый и бережный голос бренда Анны Левит: "
         "холистический терапевт сознания, атмический целитель, проводник глубинной трансформации. "
         "Говори мягко, образно, по-человечески, с метафорами и уважением к границам. "
-        "Твоя задача — поддержать, направить, предложить практики и пригласить к личной работе, VIP-медитациям и донатам. "
-        "Избегай медицинских диагнозов и обещаний. В конце, когда уместно, ненавязчиво предлагай кнопки /donate и /book."
+        "Поддерживай, предлагай практики, зови к индивидуальной работе и VIP-медитациям. "
+        "Избегай медицинских диагнозов и обещаний. Ненавязчиво предлагай /apply, /donate и /book, когда уместно."
     )
 
 def generate_aya_reply(user_text: str, username: Optional[str]) -> str:
-    """
-    Минимальная обёртка над OpenAI. Если ключа нет — даём мягкий оффлайн-ответ.
-    """
     if not OPENAI_API_KEY:
         return (
-            "Я рядом, слышу тебя 🌿\n"
-            "Сформулируй запрос — и я мягко направлю тебя к практике или шагам. "
-            "Можешь также открыть /donate или /book для поддержки и записи на сессию."
+            "Я рядом и слышу тебя 🌿\n"
+            "Сформулируй запрос — и я мягко направлю к практике или шагам.\n"
+            "Готова на сессию? Используй /apply. Хочешь поддержать — /donate."
         )
-
     try:
-        # Используем клиент 1.x (модели можно заменить, например, на gpt-4o-mini)
         from openai import OpenAI
         client = OpenAI(api_key=OPENAI_API_KEY)
-
         messages = [
             {"role": "system", "content": ask_aya_system_prompt()},
-            {"role": "user", "content": f"Пользователь @{username or 'гость'} пишет: {user_text}"}
+            {"role": "user", "content": f"Пользователь @{(username or 'гость')} пишет: {user_text}"}
         ]
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -67,32 +57,21 @@ def generate_aya_reply(user_text: str, username: Optional[str]) -> str:
     except Exception as e:
         logger.exception("OpenAI error: %s", e)
         return (
-            "Я услышала тебя 🌸 Сейчас связь с полем слегка шумит — попробуй переформулировать или повторить позже. "
-            "Также доступно: /donate и /book."
+            "Связь слегка шумит, но я рядом 🌸 Попробуй переформулировать запрос. "
+            "Если хочешь — оставь заявку через /apply или поддержи пространство через /donate."
         )
 
-# ======================
-# ОТПРАВКА В MAKE (опционально)
-# ======================
+# ---------------- ОТПРАВКА СОБЫТИЙ В MAKE ----------------
 def send_to_make(event_name: str, payload: dict):
-    """
-    Если в переменных есть MAKE_WEBHOOK_URL — отправим туда любые события.
-    """
     if not MAKE_WEBHOOK_URL:
         return
     try:
-        data = {
-            "event": event_name,
-            "payload": payload,
-            "ts": int(time.time())
-        }
+        data = {"event": event_name, "payload": payload, "ts": int(time.time())}
         requests.post(MAKE_WEBHOOK_URL, json=data, timeout=6)
     except Exception as e:
         logger.warning("MAKE webhook error: %s", e)
 
-# ======================
-# КНОПКИ ДОНАТОВ/ОПЛАТ
-# ======================
+# ---------------- КНОПКИ ДОНАТОВ/ССЫЛОК ----------------
 def donate_keyboard() -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton("💎 Boosty", url="https://boosty.to/annalevit/donate")],
@@ -102,39 +81,51 @@ def donate_keyboard() -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(buttons)
 
-def booking_keyboard() -> InlineKeyboardMarkup:
+def build_google_form_url(username: Optional[str], user_id: Optional[int], full_name: Optional[str]) -> str:
+    if GOOGLE_FORM_PREFILL_TEMPLATE:
+        url = GOOGLE_FORM_PREFILL_TEMPLATE
+        url = url.replace("{username}", (username or "").lstrip("@"))
+        url = url.replace("{user_id}", str(user_id or ""))
+        url = url.replace("{name}", full_name or "")
+        return url
+    return GOOGLE_FORM_URL or "https://docs.google.com/forms"
+
+def booking_keyboard_for(user) -> InlineKeyboardMarkup:
+    form_link = build_google_form_url(user.username, user.id, user.full_name)
     buttons = [
-        [InlineKeyboardButton("🪷 Записаться на сессию", url="https://t.me/annalevit_energylife")],
-        [InlineKeyboardButton("🎧 VIP-медитации", url="https://boosty.to/annalevit")],
+        [InlineKeyboardButton("🪷 Записаться на сессию (форма)", url=form_link)],
+        [InlineKeyboardButton("🎧 VIP-медитации (Boosty)", url="https://boosty.to/annalevit")],
         [InlineKeyboardButton("🔗 Все ссылки (DaLink)", url="https://dalink.to/annalevitpro")],
     ]
     return InlineKeyboardMarkup(buttons)
 
-# ======================
-# ХЕНДЛЕРЫ КОМАНД
-# ======================
+# ---------------- КОМАНДЫ ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     send_to_make("start", {"user_id": user.id, "username": user.username})
-
     text = (
         "Привет, я Ая — проводник потока Анны Левит 🌸\n\n"
-        "Я аккуратно поддержу тебя в процессе исцеления, энергии и ясности. "
-        "Задай вопрос словами — и я отвечу мягко и по делу.\n\n"
+        "Задай вопрос — и я мягко направлю к практике или шагам.\n\n"
         "Полезное:\n"
+        "• /apply — оставить заявку на индивидуальную сессию\n"
         "• /donate — поддержать пространство\n"
-        "• /book — запись на индивидуальную сессию и VIP-медитации\n"
+        "• /book — запись и доступ к VIP-материалам\n"
+        "• /vip — про VIP-пространство\n"
+        "• /yt — YouTube-канал и плейлист\n"
         "• /help — подсказки по командам\n"
     )
-    await update.message.reply_text(text, reply_markup=booking_keyboard())
+    await update.message.reply_text(text, reply_markup=booking_keyboard_for(user))
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "Команды:\n"
-        "• /start — приветствие\n"
+        "• /apply — заявка на сессию (форма)\n"
         "• /donate — поддержать Анну и пространство\n"
-        "• /book — запись на сессию, доступ к VIP-материалам\n\n"
-        "Можно просто писать мне сообщения — отвечу в стиле бренда."
+        "• /book — запись/материалы\n"
+        "• /vip — VIP-пространство\n"
+        "• /yt — YouTube-канал\n"
+        "• /start — приветствие\n"
+        "Можно просто писать сообщения — отвечу в стиле бренда."
     )
     await update.message.reply_text(text)
 
@@ -145,45 +136,73 @@ async def donate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def book(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
     await update.message.reply_text(
         "Запись на сессию и доступ к VIP-материалам:",
-        reply_markup=booking_keyboard()
+        reply_markup=booking_keyboard_for(user)
     )
 
-# ======================
-# ОБРАБОТКА ЛЮБОГО ТЕКСТА
-# ======================
+async def apply_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    link = build_google_form_url(user.username, user.id, user.full_name)
+    await update.message.reply_text(
+        "Открой форму заявки на сессию 🪷",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Заполнить форму", url=link)]])
+    )
+
+async def vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "💎 <b>VIP-пространство Анны Левит</b>\n\n"
+        "Закрытые практики, живые медитации и глубокие потоки. "
+        "Выбери удобный способ доступа:"
+    )
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎧 Boosty — VIP-медитации", url="https://boosty.to/annalevit")],
+        [InlineKeyboardButton("🔗 Все ссылки (DaLink)", url="https://dalink.to/annalevitpro")],
+        [InlineKeyboardButton("🌸 Telegram-канал Анны", url="https://t.me/annalevit_energylife")]
+    ])
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+async def yt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "🎥 <b>YouTube-канал Анны Левит</b>\n\n"
+        "Живые практики, трансформационные медитации и послания о силе, душе и изобилии. "
+        "Подпишись, чтобы не пропустить новое 🌬"
+    )
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🌕 Канал YouTube", url="https://www.youtube.com/@AnnaLevit_energylife")],
+        [InlineKeyboardButton("💫 Плейлист — Медитации Потока",
+                              url="https://www.youtube.com/playlist?list=PL9gq5h1U7NYGZqfE5H1Kh2H3CFYxP7_XU")],
+        [InlineKeyboardButton("✨ Telegram-анонс", url="https://t.me/annalevit_energylife")]
+    ])
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+# ---------- ОБРАБОТКА ЛЮБОГО ТЕКСТА ----------
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     msg = update.message.text or ""
-
-    send_to_make("message", {
-        "user_id": user.id,
-        "username": user.username,
-        "text": msg
-    })
+    send_to_make("message", {"user_id": user.id, "username": user.username, "text": msg})
 
     reply = generate_aya_reply(msg, user.username)
-    # Небольшой CTA (деликатно, не всегда, но можно часто)
-    tail = "\n\nМогу мягко направить дальше 🌸 Открыть /donate или /book?"
+    tail = "\n\nМогу мягко направить дальше 🌸 Нажми /apply, чтобы оставить заявку, или /donate для поддержки."
     try:
         await update.message.reply_text(reply + tail, parse_mode=ParseMode.HTML)
     except Exception:
         await update.message.reply_text(reply + tail)
 
-# ======================
-# ЗАПУСК (LONG POLLING — проще всего для Railway)
-# ======================
+# ------------------- ЗАПУСК -------------------
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("Не задан BOT_TOKEN (переменная окружения).")
-
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("donate", donate))
     app.add_handler(CommandHandler("book", book))
+    app.add_handler(CommandHandler("apply", apply_cmd))
+    app.add_handler(CommandHandler("vip", vip_cmd))
+    app.add_handler(CommandHandler("yt", yt_cmd))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), on_text))
 
     logger.info("Aya Bot started (long polling).")
